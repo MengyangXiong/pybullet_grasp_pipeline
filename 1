@@ -1,0 +1,126 @@
+import pybullet as p
+import pybullet_data
+import time
+import numpy as np
+import os
+import json
+
+# --- Basic Parameters ---
+NUM_OBJECTS = 5
+TABLE_HEIGHT = 0.0
+OBJECT_URDF = "cube_small.urdf"
+LOG_PATH = "pick_and_place_log.json"
+
+# Initialize simulation
+p.connect(p.GUI)
+p.setAdditionalSearchPath(pybullet_data.getDataPath())
+p.setGravity(0, 0, -9.8)
+
+# Load ground and workspace table
+p.loadURDF("plane.urdf")
+table_visual = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.5, 0.5, 0.02], rgbaColor=[0.8, 0.6, 0.4, 1])
+table_collision = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.5, 0.5, 0.02])
+p.createMultiBody(baseMass=0, baseCollisionShapeIndex=table_collision,
+                   baseVisualShapeIndex=table_visual, basePosition=[0.6, 0, TABLE_HEIGHT - 0.02])
+
+# Load robot arm (Franka Panda)
+panda = p.loadURDF("franka_panda/panda.urdf", useFixedBase=True)
+joint_ids = [0, 1, 2, 3, 4, 5, 6]
+end_effector = 11
+
+# Spawn random cubes on the table
+object_ids = []
+p.random.seed(42)
+for _ in range(NUM_OBJECTS):
+    x = 0.5 + np.random.uniform(-0.2, 0.2)
+    y = np.random.uniform(-0.2, 0.2)
+    z = TABLE_HEIGHT + 0.025
+    obj_id = p.loadURDF(OBJECT_URDF, [x, y, z])
+    object_ids.append(obj_id)
+
+# Helper: linear interpolation
+def interpolate(start, end, steps):
+    return [start + (end - start) * (i / steps) for i in range(steps + 1)]
+
+# Gripper control (open=True -> open fingers)
+def control_gripper(open=True):
+    pos = 0.04 if open else 0.0
+    for j in [9, 10]:
+        p.setJointMotorControl2(panda, j, p.POSITION_CONTROL, pos, force=50)
+
+# Log data for analysis
+log_data = []
+
+# Main loop for pick-and-place
+place_y = 0.4
+for obj in object_ids:
+    pos, _ = p.getBasePositionAndOrientation(obj)
+
+    # Move above the object
+    pre_grasp = list(pos)
+    pre_grasp[2] += 0.2
+    target_joints = p.calculateInverseKinematics(panda, end_effector, pre_grasp)
+    current_joints = [p.getJointState(panda, i)[0] for i in joint_ids]
+    for angles in zip(*[interpolate(current_joints[i], target_joints[i], 100) for i in range(7)]):
+        for idx, angle in zip(joint_ids, angles):
+            p.setJointMotorControl2(panda, idx, p.POSITION_CONTROL, angle)
+        p.stepSimulation()
+        time.sleep(1/240.)
+
+    # Move down to grasp
+    grasp = list(pos)
+    grasp[2] += 0.025
+    target_joints = p.calculateInverseKinematics(panda, end_effector, grasp)
+    for angles in zip(*[interpolate(p.getJointState(panda, i)[0], target_joints[i], 50) for i in range(7)]):
+        for idx, angle in zip(joint_ids, angles):
+            p.setJointMotorControl2(panda, idx, p.POSITION_CONTROL, angle)
+        p.stepSimulation()
+        time.sleep(1/240.)
+
+    # Close gripper
+    control_gripper(open=False)
+    for _ in range(50):
+        p.stepSimulation()
+        time.sleep(1/240.)
+
+    # Lift object
+    lift_joints = [target_joints[i] + np.array([0, 0.2, 0, 0, 0, 0, 0])[i] for i in range(7)]
+    for angles in zip(*[interpolate(target_joints[i], lift_joints[i], 80) for i in range(7)]):
+        for idx, angle in zip(joint_ids, angles):
+            p.setJointMotorControl2(panda, idx, p.POSITION_CONTROL, angle)
+        p.stepSimulation()
+        time.sleep(1/240.)
+
+    # Move to drop location
+    drop_target = [0.3, place_y, TABLE_HEIGHT + 0.025]
+    target_joints = p.calculateInverseKinematics(panda, end_effector, drop_target)
+    for angles in zip(*[interpolate(p.getJointState(panda, i)[0], target_joints[i], 100) for i in range(7)]):
+        for idx, angle in zip(joint_ids, angles):
+            p.setJointMotorControl2(panda, idx, p.POSITION_CONTROL, angle)
+        p.stepSimulation()
+        time.sleep(1/240.)
+
+    # Open gripper
+    control_gripper(open=True)
+    for _ in range(50):
+        p.stepSimulation()
+        time.sleep(1/240.)
+
+    # Evaluate outcome
+    final_pos, _ = p.getBasePositionAndOrientation(obj)
+    success = np.linalg.norm(np.array(final_pos) - np.array(drop_target)) < 0.02
+    log_data.append({
+        "object_id": obj,
+        "target_pos": drop_target,
+        "final_pos": final_pos,
+        "success": bool(success)
+    })
+
+    place_y -= 0.1
+
+# Save results
+with open(LOG_PATH, 'w') as f:
+    json.dump(log_data, f, indent=2)
+
+print(f"Done. Log saved at {os.path.abspath(LOG_PATH)}")
+p.disconnect()
